@@ -1,163 +1,269 @@
-from pathlib import Path
-from typing import Dict, Any
+"""
+FraudShield — model.py
+Trains a Random Forest on the 4 features the frontend actually sends:
+  - amount
+  - merchant_category (encoded)
+  - time_of_day (encoded)
+  - location_risk_score
 
+Generates 50,000 synthetic transactions with realistic fraud patterns,
+trains, evaluates, and saves the model as fraud_model.pkl
+"""
+
+import os
+import logging
 import joblib
+import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from pathlib import Path
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, classification_report
+)
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("fraudshield.model")
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = BASE_DIR.parent / "creditcard.csv"
+BASE_DIR   = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "fraud_model.pkl"
 
+# ── Feature definitions ───────────────────────────────────────────
+CATEGORIES = ["Online", "Retail", "Restaurant", "Travel",
+              "Entertainment", "Gas", "Healthcare"]
+TIMES      = ["Morning", "Afternoon", "Evening", "Night"]
 
-def train_and_save_model() -> None:
+# Fraud risk weights per category (higher = more fraudulent)
+CATEGORY_RISK = {
+    "Online":        0.35,
+    "Travel":        0.25,
+    "Entertainment": 0.20,
+    "Retail":        0.10,
+    "Gas":           0.08,
+    "Restaurant":    0.05,
+    "Healthcare":    0.03,
+}
+
+# Fraud risk weights per time of day
+TIME_RISK = {
+    "Night":     0.45,
+    "Evening":   0.25,
+    "Morning":   0.15,
+    "Afternoon": 0.10,
+}
+
+# ── Synthetic data generation ─────────────────────────────────────
+def generate_dataset(n_samples: int = 50_000, fraud_rate: float = 0.08, seed: int = 42):
     """
-    Train the RandomForest model on the creditcard.csv dataset and save it to disk.
-    Follows the exact steps specified:
-      a. Scale Amount and Time columns using StandardScaler
-      b. Handle class imbalance using class_weight='balanced'
-      c. Split 80/20 train/test
-      d. Train RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
-      e. Print accuracy, precision, recall, F1 score
-      f. Save model as fraud_model.pkl using joblib
+    Generate realistic synthetic transaction data.
+
+    Fraud patterns encoded:
+      - High amount (> ₹8,000) + Night + Online/Travel → very high fraud
+      - High location risk (> 7) + Night → elevated fraud
+      - Low amount + Daytime + Healthcare/Restaurant → very low fraud
+      - Random noise added so model can't perfectly memorise rules
     """
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"Dataset not found at {DATA_PATH}. Make sure creditcard.csv is in the project root.")
+    rng = np.random.default_rng(seed)
+    n_fraud  = int(n_samples * fraud_rate)
+    n_normal = n_samples - n_fraud
 
-    df = pd.read_csv(DATA_PATH)
+    # ── Normal transactions ───────────────────────────────────────
+    normal_amounts    = rng.lognormal(mean=6.5, sigma=1.2, size=n_normal)   # ₹50–₹5,000 range
+    normal_categories = rng.choice(CATEGORIES, size=n_normal,
+                                   p=[0.25, 0.20, 0.18, 0.10, 0.10, 0.10, 0.07])
+    normal_times      = rng.choice(TIMES, size=n_normal,
+                                   p=[0.30, 0.35, 0.25, 0.10])
+    normal_risk       = rng.uniform(0, 5, size=n_normal)                    # low risk scores
 
-    required_columns = {"Time", "Amount", "Class"}
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"Dataset is missing required columns: {missing}")
+    # ── Fraudulent transactions ───────────────────────────────────
+    # Mix of fraud patterns
+    fraud_amounts    = np.concatenate([
+        rng.uniform(8_000, 50_000, size=int(n_fraud * 0.5)),   # large amounts
+        rng.uniform(1, 50,         size=int(n_fraud * 0.3)),   # tiny amounts (card testing)
+        rng.uniform(500, 8_000,    size=int(n_fraud * 0.2)),   # mid amounts
+    ])
+    fraud_categories = rng.choice(CATEGORIES, size=n_fraud,
+                                   p=[0.40, 0.20, 0.15, 0.10, 0.08, 0.04, 0.03])
+    fraud_times      = rng.choice(TIMES, size=n_fraud,
+                                   p=[0.10, 0.10, 0.25, 0.55])   # mostly night
+    fraud_risk       = rng.uniform(5, 10, size=n_fraud)            # high risk scores
 
-    feature_columns = [col for col in df.columns if col != "Class"]
+    # ── Combine ───────────────────────────────────────────────────
+    amounts    = np.concatenate([normal_amounts, fraud_amounts])
+    categories = np.concatenate([normal_categories, fraud_categories])
+    times      = np.concatenate([normal_times, fraud_times])
+    risks      = np.concatenate([normal_risk, fraud_risk])
+    labels     = np.concatenate([np.zeros(n_normal), np.ones(n_fraud)])
 
-    X = df[feature_columns]
-    y = df["Class"]
+    # Shuffle
+    idx = rng.permutation(n_samples)
+    df  = pd.DataFrame({
+        "amount":               amounts[idx],
+        "merchant_category":    categories[idx],
+        "time_of_day":          times[idx],
+        "location_risk_score":  risks[idx],
+        "is_fraud":             labels[idx].astype(int),
+    })
 
-    numeric_to_scale = ["Time", "Amount"]
+    # Add noise: flip ~1% of labels to prevent overfitting
+    noise_idx = rng.choice(n_samples, size=int(n_samples * 0.01), replace=False)
+    df.loc[noise_idx, "is_fraud"] = 1 - df.loc[noise_idx, "is_fraud"]
+
+    return df
+
+
+# ── Model training ─────────────────────────────────────────────────
+def train_model():
+    logger.info("Generating synthetic training data (50,000 transactions)...")
+    df = generate_dataset(n_samples=50_000, fraud_rate=0.08)
+
+    fraud_count  = df["is_fraud"].sum()
+    normal_count = len(df) - fraud_count
+    logger.info(f"Dataset: {normal_count:,} normal | {fraud_count:,} fraud ({fraud_count/len(df)*100:.1f}%)")
+
+    X = df.drop("is_fraud", axis=1)
+    y = df["is_fraud"]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # ── Preprocessing pipeline ────────────────────────────────────
+    numeric_features     = ["amount", "location_risk_score"]
+    categorical_features = ["merchant_category", "time_of_day"]
+
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", StandardScaler(), numeric_features),
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical_features),
+    ])
+
+    # ── Classifier ────────────────────────────────────────────────
+    clf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=12,
+        min_samples_leaf=5,
+        class_weight="balanced",
         random_state=42,
-        stratify=y,
+        n_jobs=-1,
     )
 
-    # Scale only Time/Amount and pass the rest through unchanged.
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("scale_time_amount", StandardScaler(with_mean=True, with_std=True), numeric_to_scale),
-        ],
-        remainder="passthrough",
-        verbose_feature_names_out=False,
-    )
+    pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier",   clf),
+    ])
 
-    pipeline = Pipeline(
-        steps=[
-            ("preprocess", preprocessor),
-            (
-                "model",
-                RandomForestClassifier(
-                    n_estimators=100,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-
+    logger.info("Training Random Forest (200 trees)...")
     pipeline.fit(X_train, y_train)
-    y_pred = pipeline.predict(X_test)
 
-    accuracy = accuracy_score(y_test, y_pred)
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall = recall_score(y_test, y_pred, zero_division=0)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
+    # ── Evaluation ────────────────────────────────────────────────
+    y_pred      = pipeline.predict(X_test)
+    y_pred_prob = pipeline.predict_proba(X_test)[:, 1]
 
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
+    accuracy  = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall    = recall_score(y_test, y_pred)
+    f1        = f1_score(y_test, y_pred)
+    auc       = roc_auc_score(y_test, y_pred_prob)
 
-    joblib.dump({"pipeline": pipeline, "feature_columns": feature_columns}, MODEL_PATH)
-    print(f"Model saved to {MODEL_PATH}")
+    logger.info("=" * 50)
+    logger.info(f"  Accuracy:  {accuracy:.4f}")
+    logger.info(f"  Precision: {precision:.4f}")
+    logger.info(f"  Recall:    {recall:.4f}")
+    logger.info(f"  F1 Score:  {f1:.4f}")
+    logger.info(f"  ROC-AUC:   {auc:.4f}")
+    logger.info("=" * 50)
+    logger.info("\n" + classification_report(y_test, y_pred, target_names=["Normal", "Fraud"]))
 
-
-_MODEL_CACHE: Dict[str, Any] = {}
-
-
-def load_model() -> Dict[str, Any]:
-    if _MODEL_CACHE:
-        return _MODEL_CACHE
-
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Trained model not found at {MODEL_PATH}. Run `python model.py` to train and save the model."
-        )
-
-    _MODEL_CACHE.update(joblib.load(MODEL_PATH))
-    return _MODEL_CACHE
-
-
-def _map_time_of_day_to_time_value(time_of_day: str) -> float:
-    mapping = {
-        "Morning": 9.0,
-        "Afternoon": 14.0,
-        "Evening": 19.0,
-        "Night": 1.0,
+    # ── Save ──────────────────────────────────────────────────────
+    artifact = {
+        "pipeline":           pipeline,
+        "feature_columns":    numeric_features + categorical_features,
+        "numeric_features":   numeric_features,
+        "categorical_features": categorical_features,
+        "metrics": {
+            "accuracy":  round(accuracy,  4),
+            "precision": round(precision, 4),
+            "recall":    round(recall,    4),
+            "f1":        round(f1,        4),
+            "auc":       round(auc,       4),
+        },
     }
-    return mapping.get(time_of_day, 12.0)
+    joblib.dump(artifact, MODEL_PATH)
+    logger.info(f"Model saved → {MODEL_PATH}")
+    return pipeline
 
 
-def predict_transaction(features: Dict[str, Any]) -> float:
+# ── Model loading (cached) ────────────────────────────────────────
+_MODEL_CACHE: dict = {}
+
+def load_model():
+    if "pipeline" not in _MODEL_CACHE:
+        if not MODEL_PATH.exists():
+            logger.warning("Model not found — training now...")
+            train_model()
+        artifact = joblib.load(MODEL_PATH)
+        _MODEL_CACHE.update(artifact)
+        m = artifact.get("metrics", {})
+        logger.info(
+            f"Model loaded | AUC={m.get('auc','?')} "
+            f"Recall={m.get('recall','?')} F1={m.get('f1','?')}"
+        )
+    return _MODEL_CACHE["pipeline"]
+
+
+# ── Inference ─────────────────────────────────────────────────────
+def predict_transaction(features: dict) -> float:
     """
-    Predict the fraud probability for a single transaction.
+    Returns fraud probability (0.0 – 1.0) for a single transaction.
 
-    The training dataset uses columns: Time, V1-V28, Amount.
-    Incoming API features are business-level fields:
-      - amount
-      - merchant_category
-      - time_of_day
-      - location_risk_score
-
-    For now, we map these into the model feature space by:
-      - Using `amount` directly as Amount
-      - Converting `time_of_day` into a numeric Time value
-      - Filling V1-V28 with zeros (model still benefits from Amount/Time patterns)
+    Expected keys:
+        amount               (float)  — transaction amount in ₹
+        merchant_category    (str)    — e.g. "Online", "Retail"
+        time_of_day          (str)    — "Morning" / "Afternoon" / "Evening" / "Night"
+        location_risk_score  (float)  — 0 to 10
     """
-    model_bundle = load_model()
-    pipeline: Pipeline = model_bundle["pipeline"]
-    feature_columns = model_bundle["feature_columns"]
+    pipeline = load_model()
 
-    amount = float(features.get("amount", 0.0))
-    time_of_day = str(features.get("time_of_day", "Afternoon"))
+    row = {
+        "amount":               float(features.get("amount", 0.0)),
+        "merchant_category":    str(features.get("merchant_category", "Online")),
+        "time_of_day":          str(features.get("time_of_day", "Afternoon")),
+        "location_risk_score":  float(features.get("location_risk_score", 5.0)),
+    }
 
-    time_value = _map_time_of_day_to_time_value(time_of_day)
-
-    row: Dict[str, float] = {}
-    for col in feature_columns:
-        if col == "Amount":
-            row[col] = amount
-        elif col == "Time":
-            row[col] = time_value
-        else:
-            row[col] = 0.0
-
-    X = pd.DataFrame([row], columns=feature_columns)
-    proba = pipeline.predict_proba(X)[0][1]
-    return float(proba)
+    X    = pd.DataFrame([row])
+    prob = pipeline.predict_proba(X)[0][1]
+    return round(float(prob), 4)
 
 
+# ── Run training directly ─────────────────────────────────────────
 if __name__ == "__main__":
-    train_and_save_model()
+    # Delete old model first so we get a clean retrain
+    if MODEL_PATH.exists():
+        MODEL_PATH.unlink()
+        logger.info("Deleted old fraud_model.pkl")
 
+    train_model()
+    logger.info("Done. Test predictions:")
+
+    test_cases = [
+        {"amount": 45000, "merchant_category": "Online",      "time_of_day": "Night",     "location_risk_score": 9.0},
+        {"amount": 150,   "merchant_category": "Restaurant",  "time_of_day": "Afternoon", "location_risk_score": 1.5},
+        {"amount": 12000, "merchant_category": "Travel",      "time_of_day": "Night",     "location_risk_score": 8.0},
+        {"amount": 50,    "merchant_category": "Healthcare",  "time_of_day": "Morning",   "location_risk_score": 2.0},
+        {"amount": 800,   "merchant_category": "Online",      "time_of_day": "Night",     "location_risk_score": 7.5},
+    ]
+
+    for t in test_cases:
+        prob = predict_transaction(t)
+        tag  = "FRAUD" if prob > 0.7 else "SUSPICIOUS" if prob > 0.3 else "SAFE"
+        logger.info(
+            f"  ₹{t['amount']:>8,.0f} | {t['merchant_category']:<13} | "
+            f"{t['time_of_day']:<10} | Risk {t['location_risk_score']} → "
+            f"{prob:.4f} [{tag}]"
+        )
