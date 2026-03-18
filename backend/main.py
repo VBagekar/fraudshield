@@ -7,10 +7,10 @@ from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from .database import Base, engine, get_db
-from .model import predict_transaction, load_model
-from .models import Transaction
-from .schemas import TransactionInput, TransactionResponse, StatsResponse
+from database import Base, engine, get_db
+from model import predict_transaction, load_model
+from models import Transaction
+from schemas import TransactionInput, TransactionResponse, StatsResponse
 
 
 logger = logging.getLogger("fraudshield")

@@ -5,7 +5,7 @@ from sqlalchemy import Column, String, Float, Boolean, DateTime
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.types import CHAR
 
-from .database import Base
+from database import Base
 
 
 class Transaction(Base):
